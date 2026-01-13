@@ -1,0 +1,60 @@
+# =========================
+# Node / JS
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Build outputs
+# =========================
+dist/
+build/
+out/
+.cache/
+.tmp/
+
+# =========================
+# Vite / React
+# =========================
+.vite/
+.vite-cache/
+
+# =========================
+# TypeScript
+# =========================
+*.tsbuildinfo
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+*.local
+
+# =========================
+# Cloudflare / Wrangler
+# =========================
+.wrangler/
+wrangler.toml.bak
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Editor / IDE
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Test artifacts
+# =========================
+coverage/
