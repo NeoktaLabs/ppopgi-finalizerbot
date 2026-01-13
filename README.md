@@ -1,14 +1,35 @@
-# Ppopgi Finalizer Bot
+# Ppopgi (뽑기) — Finalizer Bot
 
-The Ppopgi Finalizer Bot is a permissionless automation service that ensures raffles on **Ppopgi** always reach a final state.
+This repository contains the **Finalizer Bot** for Ppopgi, a permissionless automation service ensuring raffle liveness on **Etherlink (Tezos L2)**.
 
-Running on **Cloudflare Workers (Cron)**, the bot continuously scans the on-chain registry and identifies raffles that are eligible to be finalized or canceled. When conditions are met, it safely calls the `finalize()` function using exact oracle fees and on-chain simulation to avoid wasted transactions.
+While anyone can finalize a raffle manually, this bot acts as a safety net to prevent raffles from becoming stuck.
 
-The bot is designed with reliability and efficiency in mind:
-- Hybrid hot/cold scanning to scale to thousands of raffles
-- Multicall-based filtering to minimize RPC load
-- Idempotency guards to prevent repeated fee spending
-- Exact-fee payments for entropy requests
-- Serverless execution with no long-running infrastructure
+## What the bot does
+- Scans the on-chain registry for active raffles
+- Detects raffles eligible for finalization or cancellation
+- Calls `finalize()` with the correct randomness fee
+- Ensures raffles always reach a terminal state
 
-The Finalizer Bot guarantees protocol liveness while keeping operational costs low and predictable.
+## Design Principles
+- Permissionless (no special privileges)
+- Exact fee payment (no overpayment dust)
+- Idempotent and crash-safe execution
+- Minimal RPC and gas usage
+- No custody of user funds
+
+## Technology
+- Cloudflare Workers (Cron)
+- viem
+- Etherlink RPC
+- Cloudflare KV (locking, cursors, idempotency)
+
+## Operational Notes
+- Runs every minute
+- Uses a dedicated low-balance hot wallet
+- Safe to run even when no raffles exist
+
+## Important Notice
+This bot is optional infrastructure and does not introduce trust assumptions.  
+Raffles remain fully permissionless even without it.
+
+The bot is experimental and provided as-is.
