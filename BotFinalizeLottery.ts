@@ -25,12 +25,21 @@ export interface Env {
 }
 
 // Etherlink Config
+// Etherlink Config
 const ETHERLINK = defineChain({
   id: 42793,
   name: "Etherlink Mainnet",
   network: "etherlink",
   nativeCurrency: { name: "Tezos", symbol: "XTZ", decimals: 18 },
   rpcUrls: { default: { http: ["https://node.mainnet.etherlink.com"] } },
+
+  // ✅ Add this
+  contracts: {
+    multicall3: {
+      address: "0xcA11bde05977b3631167028862bE2a173976CA11",
+      blockCreated: 0, // ok to leave 0 if you don't know the exact deployment block
+    },
+  },
 });
 
 // ABIs
