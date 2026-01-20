@@ -8,7 +8,7 @@ import {
   type Address,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { etherlink } from "viem/chains"; // ✅ use viem's built-in chain config
+import { etherlink } from "viem/chains";
 
 // --- TYPES & INTERFACES ---
 export interface Env {
@@ -105,6 +105,18 @@ function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): numbe
   return 0;
 }
 
+// map status number to label (your Solidity enum order)
+function statusLabel(s: bigint): string {
+  switch (s) {
+    case 0n: return "FundingPending(0)";
+    case 1n: return "Open(1)";
+    case 2n: return "Drawing(2)";
+    case 3n: return "Completed(3)";
+    case 4n: return "Canceled(4)";
+    default: return `Unknown(${s.toString()})`;
+  }
+}
+
 // --- MAIN WORKER ---
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
@@ -114,7 +126,6 @@ export default {
 
     console.log(`🤖 Run ${runId} started`);
 
-    // 1) LOCK ACQUISITION (best-effort)
     const existingLock = await env.BOT_STATE.get("lock");
     if (existingLock) {
       console.warn(`⚠️ Locked by run ${existingLock}. Skipping.`);
@@ -134,7 +145,6 @@ export default {
     } catch (e: any) {
       console.error("❌ Critical Error:", e?.message || e);
     } finally {
-      // 2) LOCK RELEASE
       const currentLock = await env.BOT_STATE.get("lock");
       if (currentLock === runId) {
         await env.BOT_STATE.delete("lock");
@@ -152,11 +162,9 @@ async function runLogic(env: Env, startTimeMs: number) {
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
 
-  // ✅ Use built-in Etherlink chain config (fixes multicall config issues)
   const client = createPublicClient({ chain: etherlink, transport: http(rpcUrl) });
   const wallet = createWalletClient({ account, chain: etherlink, transport: http(rpcUrl) });
 
-  // Optional: log bot address once per run (helps debugging)
   console.log(`👛 Bot address: ${account.address}`);
 
   // Tuning
@@ -214,11 +222,9 @@ async function runLogic(env: Env, startTimeMs: number) {
       : Promise.resolve([] as Address[]),
   ]);
 
-  // Compute next cursor; commit it at end
   let nextCursor = startCold + safeColdSize;
   if (nextCursor >= total) nextCursor = 0n;
 
-  // Deduplicate candidates
   const candidates = Array.from(new Set([...hotBatch, ...coldBatch]));
   if (candidates.length === 0) {
     console.log("ℹ️ No candidates. Done.");
@@ -226,7 +232,7 @@ async function runLogic(env: Env, startTimeMs: number) {
     return;
   }
 
-  // --- 4) STATUS FILTER (Multicall) ---
+  // --- 4) STATUS FILTER (Multicall + logging) ---
   const statusResults = await client.multicall({
     contracts: candidates.map((addr) => ({
       address: addr,
@@ -235,14 +241,48 @@ async function runLogic(env: Env, startTimeMs: number) {
     })),
   });
 
-  // ✅ Debug: count multicall failures so we know if multicall is still the culprit
   const statusFailures = statusResults.filter((r) => r.status !== "success").length;
   console.log(`🧪 status multicall: total=${statusResults.length} failures=${statusFailures}`);
 
+  // ✅ NEW: log each candidate’s status (so we stop guessing)
+  for (let i = 0; i < candidates.length; i++) {
+    const addr = candidates[i];
+    const r = statusResults[i];
+
+    if (r.status === "success") {
+      const s = BigInt(r.result as bigint);
+      console.log(`🔎 ${addr} status=${statusLabel(s)}`);
+    } else {
+      console.log(`🔎 ${addr} status=CALL_FAILED (will try direct read)`);
+    }
+  }
+
+  // ✅ NEW: fallback to direct reads for any multicall failures (rare, but safe)
+  const statuses: bigint[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const r = statusResults[i];
+    if (r.status === "success") {
+      statuses.push(BigInt(r.result as bigint));
+      continue;
+    }
+
+    try {
+      const s = await client.readContract({
+        address: candidates[i],
+        abi: lotteryAbi,
+        functionName: "status",
+      });
+      statuses.push(BigInt(s));
+      console.log(`🔁 direct status ${candidates[i]} => ${statusLabel(BigInt(s))}`);
+    } catch (e: any) {
+      console.warn(`⚠️ direct status failed for ${candidates[i]}: ${(e?.shortMessage || e?.message || e)}`);
+      statuses.push(9999n);
+    }
+  }
+
   const openLotteries: Address[] = [];
-  statusResults.forEach((res, i) => {
-    // Open = 1 (uint8 -> bigint)
-    if (res.status === "success" && res.result === 1n) openLotteries.push(candidates[i]);
+  statuses.forEach((s, i) => {
+    if (s === 1n) openLotteries.push(candidates[i]); // Open = 1
   });
 
   if (openLotteries.length === 0) {
@@ -271,7 +311,6 @@ async function runLogic(env: Env, startTimeMs: number) {
 
     const tNow = nowSec();
 
-    // Detail multicall (7 calls per lottery)
     const detailCalls = chunk.flatMap((addr) => [
       { address: addr, abi: lotteryAbi, functionName: "deadline" },
       { address: addr, abi: lotteryAbi, functionName: "getSold" },
@@ -323,7 +362,7 @@ async function runLogic(env: Env, startTimeMs: number) {
       if (rPaused.result === true) continue;
 
       const reqId = BigInt(rReq.result as bigint);
-      if (reqId !== 0n) continue; // request pending
+      if (reqId !== 0n) continue;
 
       const deadline = BigInt(rDeadline.result as bigint);
       const sold = BigInt(rSold.result as bigint);
@@ -351,7 +390,6 @@ async function runLogic(env: Env, startTimeMs: number) {
 
     if (actionable.length === 0) continue;
 
-    // prioritize
     actionable.sort((a, b) => b.score - a.score);
 
     for (const c of actionable) {
@@ -366,17 +404,12 @@ async function runLogic(env: Env, startTimeMs: number) {
         `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} max=${c.maxTickets})`
       );
 
-      // Fee lookup (KV cache first)
       const feeKey = `fee:${lower(c.entropyAddr)}:${lower(c.providerAddr)}`;
       let fee: bigint | null = null;
 
       const cachedFee = await env.BOT_STATE.get(feeKey);
       if (cachedFee) {
-        try {
-          fee = BigInt(cachedFee);
-        } catch {
-          fee = null;
-        }
+        try { fee = BigInt(cachedFee); } catch { fee = null; }
       }
 
       if (fee === null) {
@@ -407,7 +440,6 @@ async function runLogic(env: Env, startTimeMs: number) {
           continue;
         }
 
-        // Fee mismatch -> refresh fee once
         if (msg.includes("InsufficientFee") || msg.toLowerCase().includes("insufficient fee")) {
           try {
             const refreshedFee = await client.readContract({
@@ -440,7 +472,6 @@ async function runLogic(env: Env, startTimeMs: number) {
         }
       }
 
-      // Mark attempt only after passing simulation
       await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
 
       // --- SEND TX ---
@@ -463,8 +494,6 @@ async function runLogic(env: Env, startTimeMs: number) {
     }
   }
 
-  // Update cursor
   await env.BOT_STATE.put("cursor", nextCursor.toString());
-
   console.log(`🏁 Run complete. txCount=${txCount} cursor=${nextCursor.toString()}`);
 }
