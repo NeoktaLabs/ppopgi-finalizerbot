@@ -1,6 +1,6 @@
 {
   "devDependencies": {
-    "wrangler": "^4.58.0"
+    "wrangler": "^4.59.2"
   },
   "name": "ppopgi-finalizerbot",
   "version": "1.0.0",
