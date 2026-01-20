@@ -1,3 +1,4 @@
+// BotFinalizeLottery.ts
 import {
   createPublicClient,
   createWalletClient,
@@ -7,7 +8,7 @@ import {
   type Address,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { defineChain } from "viem";
+import { etherlink } from "viem/chains"; // ✅ use viem's built-in chain config
 
 // --- TYPES & INTERFACES ---
 export interface Env {
@@ -23,24 +24,6 @@ export interface Env {
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
 }
-
-// Etherlink Config
-// Etherlink Config
-const ETHERLINK = defineChain({
-  id: 42793,
-  name: "Etherlink Mainnet",
-  network: "etherlink",
-  nativeCurrency: { name: "Tezos", symbol: "XTZ", decimals: 18 },
-  rpcUrls: { default: { http: ["https://node.mainnet.etherlink.com"] } },
-
-  // ✅ Add this
-  contracts: {
-    multicall3: {
-      address: "0xcA11bde05977b3631167028862bE2a173976CA11",
-      blockCreated: 0, // ok to leave 0 if you don't know the exact deployment block
-    },
-  },
-});
 
 // ABIs
 const registryAbi = parseAbi([
@@ -162,13 +145,19 @@ export default {
 };
 
 async function runLogic(env: Env, startTimeMs: number) {
-  if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS) throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS");
+  if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS) {
+    throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS");
+  }
 
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
 
-  const client = createPublicClient({ chain: ETHERLINK, transport: http(rpcUrl) });
-  const wallet = createWalletClient({ account, chain: ETHERLINK, transport: http(rpcUrl) });
+  // ✅ Use built-in Etherlink chain config (fixes multicall config issues)
+  const client = createPublicClient({ chain: etherlink, transport: http(rpcUrl) });
+  const wallet = createWalletClient({ account, chain: etherlink, transport: http(rpcUrl) });
+
+  // Optional: log bot address once per run (helps debugging)
+  console.log(`👛 Bot address: ${account.address}`);
 
   // Tuning
   const HOT_SIZE = getSafeSize(env.HOT_SIZE, 100n, 500n);
@@ -245,6 +234,10 @@ async function runLogic(env: Env, startTimeMs: number) {
       functionName: "status",
     })),
   });
+
+  // ✅ Debug: count multicall failures so we know if multicall is still the culprit
+  const statusFailures = statusResults.filter((r) => r.status !== "success").length;
+  console.log(`🧪 status multicall: total=${statusResults.length} failures=${statusFailures}`);
 
   const openLotteries: Address[] = [];
   statusResults.forEach((res, i) => {
@@ -330,7 +323,7 @@ async function runLogic(env: Env, startTimeMs: number) {
       if (rPaused.result === true) continue;
 
       const reqId = BigInt(rReq.result as bigint);
-      if (reqId !== 0n) continue; // request pending (shouldn't happen in Open often, but safe)
+      if (reqId !== 0n) continue; // request pending
 
       const deadline = BigInt(rDeadline.result as bigint);
       const sold = BigInt(rSold.result as bigint);
@@ -365,7 +358,6 @@ async function runLogic(env: Env, startTimeMs: number) {
       if (txCount >= MAX_TX) break;
       if (Date.now() - startTimeMs > TIME_BUDGET_MS) break;
 
-      // Idempotency guard (check only when we're about to act)
       const attemptKey = `attempt:${lower(c.addr)}`;
       const recentAttempt = await env.BOT_STATE.get(attemptKey);
       if (recentAttempt) continue;
@@ -380,7 +372,11 @@ async function runLogic(env: Env, startTimeMs: number) {
 
       const cachedFee = await env.BOT_STATE.get(feeKey);
       if (cachedFee) {
-        try { fee = BigInt(cachedFee); } catch { fee = null; }
+        try {
+          fee = BigInt(cachedFee);
+        } catch {
+          fee = null;
+        }
       }
 
       if (fee === null) {
@@ -390,7 +386,6 @@ async function runLogic(env: Env, startTimeMs: number) {
           functionName: "getFee",
           args: [c.providerAddr],
         });
-        // cache for 60s
         await env.BOT_STATE.put(feeKey, fee.toString(), { expirationTtl: 60 });
       }
 
@@ -437,15 +432,15 @@ async function runLogic(env: Env, startTimeMs: number) {
             continue;
           }
         } else {
-          // likely NotReadyToFinalize / RequestPending / already finalized etc.
           console.warn(`   ⏭️ Simulation revert: ${msg}`);
-          // Short cooldown to avoid hammering reverts (not full ATTEMPT_TTL)
-          await env.BOT_STATE.put(attemptKey, `revert:${Date.now()}`, { expirationTtl: Math.min(120, ATTEMPT_TTL_SEC) });
+          await env.BOT_STATE.put(attemptKey, `revert:${Date.now()}`, {
+            expirationTtl: Math.min(120, ATTEMPT_TTL_SEC),
+          });
           continue;
         }
       }
 
-      // Now mark attempt ONLY after passing simulation (prevents liveness loss on RPC issues)
+      // Mark attempt only after passing simulation
       await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
 
       // --- SEND TX ---
@@ -464,12 +459,11 @@ async function runLogic(env: Env, startTimeMs: number) {
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ Tx failed: ${msg}`);
-        // keep attempt TTL to prevent fee burn spamming; expires naturally
       }
     }
   }
 
-  // Update cursor after processing phase
+  // Update cursor
   await env.BOT_STATE.put("cursor", nextCursor.toString());
 
   console.log(`🏁 Run complete. txCount=${txCount} cursor=${nextCursor.toString()}`);
