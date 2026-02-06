@@ -4,7 +4,7 @@ compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/2 * * * *"]
 
 [[kv_namespaces]]
 binding = "BOT_STATE"
@@ -22,5 +22,5 @@ TIME_BUDGET_MS = "25000"
 ATTEMPT_TTL_SEC = "600"
 
 # ✅ NEW (Twitter sync)
-SUBGRAPH_URL = "https://YOUR_SUBGRAPH_ENDPOINT"
-SITE_URL = "https://YOUR_SITE_DOMAIN"
+SUBGRAPH_URL = "https://gateway.thegraph.com/api/24c1de4d71a1e5990e8a3e91987c8741/subgraphs/id/BWeTkqhD2jWvCeTGEKoM54KCTq5ZXAA2Hs7tQv1gLt6S"
+SITE_URL = "https://ppopgi.xyz"
