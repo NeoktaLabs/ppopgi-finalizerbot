@@ -23,10 +23,6 @@ export interface Env {
   MAX_TX?: string;
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
-
-  // Optional knobs (safe defaults below)
-  RPC_TIMEOUT_MS?: string;
-  RPC_RETRIES?: string;
 }
 
 // ABIs
@@ -90,7 +86,6 @@ function isTransientErrorMessage(msg: string): boolean {
   return (
     m.includes("timeout") ||
     m.includes("timed out") ||
-    m.includes("fetch") ||
     m.includes("network") ||
     m.includes("gateway") ||
     m.includes("503") ||
@@ -99,19 +94,7 @@ function isTransientErrorMessage(msg: string): boolean {
     m.includes("connection") ||
     m.includes("econn") ||
     m.includes("failed to fetch") ||
-    m.includes("502") ||
-    m.includes("504")
-  );
-}
-
-function isNonceErrorMessage(msg: string): boolean {
-  const m = msg.toLowerCase();
-  return (
-    m.includes("nonce too low") ||
-    m.includes("replacement transaction underpriced") ||
-    m.includes("already known") ||
-    m.includes("nonce has already been used") ||
-    m.includes("invalid nonce")
+    m.includes("request took too long")
   );
 }
 
@@ -141,47 +124,105 @@ function statusLabel(s: bigint): string {
   }
 }
 
-/**
- * Cloudflare-worker-friendly fetch wrapper:
- * - request timeout via AbortController
- * - retries on transient HTTP codes and network errors
- */
-async function fetchWithTimeoutAndRetry(
-  input: RequestInfo,
-  init: RequestInit | undefined,
-  timeoutMs: number,
-  retries: number
-): Promise<Response> {
-  let lastErr: any;
+async function sleep(ms: number) {
+  await new Promise((r) => setTimeout(r, ms));
+}
 
-  for (let i = 0; i <= retries; i++) {
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), timeoutMs);
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts: { tries: number; baseDelayMs: number; label?: string; isRetryable?: (e: any) => boolean }
+): Promise<T> {
+  const tries = Math.max(1, opts.tries);
+  const base = Math.max(0, opts.baseDelayMs);
+  const isRetryable = opts.isRetryable ?? ((e: any) => isTransientErrorMessage(String(e?.message || e)));
 
+  let lastErr: any = null;
+
+  for (let i = 0; i < tries; i++) {
     try {
-      const res = await fetch(input, { ...(init || {}), signal: ac.signal });
-      clearTimeout(t);
-
-      if ([429, 502, 503, 504].includes(res.status) && i < retries) {
-        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
-        continue;
-      }
-      return res;
-    } catch (e) {
-      clearTimeout(t);
+      return await fn();
+    } catch (e: any) {
       lastErr = e;
-      if (i < retries) {
-        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
-        continue;
+      const msg = (e?.shortMessage || e?.message || String(e)).toString();
+      const retryable = isRetryable(e);
+
+      if (!retryable || i === tries - 1) {
+        if (opts.label) console.warn(`   ⛔ ${opts.label} failed: ${msg}`);
+        throw e;
       }
+
+      const delay = Math.min(4000, base * Math.pow(2, i));
+      if (opts.label) console.warn(`   🌧️ ${opts.label} transient error: ${msg} (retry in ${delay}ms)`);
+      await sleep(delay);
     }
   }
 
   throw lastErr;
 }
 
+async function kvPutSafe(env: Env, key: string, value: string, ttlSec = 7 * 24 * 3600) {
+  try {
+    await env.BOT_STATE.put(key, value, { expirationTtl: ttlSec });
+  } catch {
+    // ignore
+  }
+}
+
+async function kvDelSafe(env: Env, key: string) {
+  try {
+    await env.BOT_STATE.delete(key);
+  } catch {
+    // ignore
+  }
+}
+
+// For UI: approximate "next cron" when cron is "* * * * *"
+function nextMinuteMs(now = Date.now()): number {
+  return Math.ceil(now / 60000) * 60000;
+}
+
 // --- MAIN WORKER ---
 export default {
+  /**
+   * Optional: expose health/status to your website.
+   * GET /  -> returns JSON with last run + next run + whether lock is held
+   */
+  async fetch(_req: Request, env: Env): Promise<Response> {
+    const lastRunRaw = await env.BOT_STATE.get("last_run_ts");
+    const lastOkRaw = await env.BOT_STATE.get("last_ok_ts");
+    const status = (await env.BOT_STATE.get("last_run_status")) || "unknown";
+    const lastError = await env.BOT_STATE.get("last_run_error");
+    const lock = await env.BOT_STATE.get("lock");
+
+    const now = Date.now();
+    const nrm = (v: string | null) => (v ? Number(v) : null);
+
+    const lastRun = nrm(lastRunRaw);
+    const lastOk = nrm(lastOkRaw);
+
+    const nextRun = nextMinuteMs(now);
+
+    return new Response(
+      JSON.stringify(
+        {
+          status,
+          running: !!lock,
+          lockRunId: lock || null,
+          lastRun,
+          secondsSinceLastRun: lastRun ? Math.floor((now - lastRun) / 1000) : null,
+          lastOk,
+          secondsSinceLastOk: lastOk ? Math.floor((now - lastOk) / 1000) : null,
+          nextRun,
+          secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
+          lastError: lastError || null,
+        },
+        null,
+        2
+      ),
+      { headers: { "content-type": "application/json; charset=utf-8" } }
+    );
+  },
+
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     const START_TIME = Date.now();
     const LOCK_TTL_SEC = 180;
@@ -189,9 +230,16 @@ export default {
 
     console.log(`🤖 Run ${runId} started`);
 
+    // write run markers early (best effort)
+    await kvPutSafe(env, "last_run_ts", START_TIME.toString());
+    await kvPutSafe(env, "last_run_status", "running");
+    await kvPutSafe(env, "last_run_id", runId);
+    await kvDelSafe(env, "last_run_error");
+
     const existingLock = await env.BOT_STATE.get("lock");
     if (existingLock) {
       console.warn(`⚠️ Locked by run ${existingLock}. Skipping.`);
+      await kvPutSafe(env, "last_run_status", "skipped_locked");
       return;
     }
 
@@ -200,13 +248,19 @@ export default {
     const confirmLock = await env.BOT_STATE.get("lock");
     if (confirmLock !== runId) {
       console.warn(`⚠️ Lock race lost. Exiting.`);
+      await kvPutSafe(env, "last_run_status", "skipped_lock_race");
       return;
     }
 
     try {
       await runLogic(env, START_TIME);
+      await kvPutSafe(env, "last_run_status", "ok");
+      await kvPutSafe(env, "last_ok_ts", Date.now().toString());
     } catch (e: any) {
-      console.error("❌ Critical Error:", e?.message || e);
+      const msg = (e?.message || String(e)).toString();
+      console.error("❌ Critical Error:", msg);
+      await kvPutSafe(env, "last_run_status", "error");
+      await kvPutSafe(env, "last_run_error", msg.slice(0, 500));
     } finally {
       const currentLock = await env.BOT_STATE.get("lock");
       if (currentLock === runId) {
@@ -223,22 +277,21 @@ async function runLogic(env: Env, startTimeMs: number) {
   }
 
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
-
-  // These defaults are tuned for your cron every minute + 25s budget
-  const RPC_TIMEOUT_MS = getSafeInt(env.RPC_TIMEOUT_MS, 12_000, 30_000);
-  const RPC_RETRIES = getSafeInt(env.RPC_RETRIES, 2, 5);
-
-  const transport = http(rpcUrl, {
-    fetch: (input, init) => fetchWithTimeoutAndRetry(input, init, RPC_TIMEOUT_MS, RPC_RETRIES),
-  });
-
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
+
+  // ✅ Tighten RPC timeouts + retries to avoid the “request took too long” killing the whole run
+  // Note: viem `http()` supports `timeout`, `retryCount`, `retryDelay`.
+  const transport = http(rpcUrl, {
+    timeout: 12_000,
+    retryCount: 2,
+    retryDelay: 400,
+  });
 
   const client = createPublicClient({ chain: etherlink, transport });
   const wallet = createWalletClient({ account, chain: etherlink, transport });
 
   console.log(`👛 Bot address: ${account.address}`);
-  console.log(`🌐 RPC: ${rpcUrl} (timeout=${RPC_TIMEOUT_MS}ms retries=${RPC_RETRIES})`);
+  console.log(`🌐 RPC: ${rpcUrl}`);
 
   const HOT_SIZE = getSafeSize(env.HOT_SIZE, 100n, 500n);
   const COLD_SIZE = getSafeSize(env.COLD_SIZE, 50n, 200n);
@@ -247,11 +300,15 @@ async function runLogic(env: Env, startTimeMs: number) {
   const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
-  const total = await client.readContract({
-    address: env.REGISTRY_ADDRESS as Address,
-    abi: registryAbi,
-    functionName: "getAllLotteriesCount",
-  });
+  const total = await withRetry(
+    () =>
+      client.readContract({
+        address: env.REGISTRY_ADDRESS as Address,
+        abi: registryAbi,
+        functionName: "getAllLotteriesCount",
+      }),
+    { tries: 3, baseDelayMs: 250, label: "getAllLotteriesCount" }
+  );
 
   if (total === 0n) {
     console.log("ℹ️ Registry empty. Done.");
@@ -266,30 +323,36 @@ async function runLogic(env: Env, startTimeMs: number) {
   if (cursor >= total) cursor = 0n;
 
   const startCold = cursor;
-  const safeColdSize = (total - startCold) < COLD_SIZE ? (total - startCold) : COLD_SIZE;
+  const safeColdSize = (total - startCold) < COLD_SIZE ? total - startCold : COLD_SIZE;
 
   console.log(
     `🔍 Scanning: Hot[${startHot}..${startHot + safeHotSize}) Cold[${startCold}..${startCold + safeColdSize}) total=${total}`
   );
 
-  const [hotBatch, coldBatch] = await Promise.all([
-    safeHotSize > 0n
-      ? client.readContract({
-          address: env.REGISTRY_ADDRESS as Address,
-          abi: registryAbi,
-          functionName: "getAllLotteries",
-          args: [startHot, safeHotSize],
-        })
-      : Promise.resolve([] as Address[]),
-    safeColdSize > 0n
-      ? client.readContract({
-          address: env.REGISTRY_ADDRESS as Address,
-          abi: registryAbi,
-          functionName: "getAllLotteries",
-          args: [startCold, safeColdSize],
-        })
-      : Promise.resolve([] as Address[]),
-  ]);
+  const [hotBatch, coldBatch] = await withRetry(
+    async () => {
+      const [h, c] = await Promise.all([
+        safeHotSize > 0n
+          ? client.readContract({
+              address: env.REGISTRY_ADDRESS as Address,
+              abi: registryAbi,
+              functionName: "getAllLotteries",
+              args: [startHot, safeHotSize],
+            })
+          : Promise.resolve([] as Address[]),
+        safeColdSize > 0n
+          ? client.readContract({
+              address: env.REGISTRY_ADDRESS as Address,
+              abi: registryAbi,
+              functionName: "getAllLotteries",
+              args: [startCold, safeColdSize],
+            })
+          : Promise.resolve([] as Address[]),
+      ]);
+      return [h, c] as const;
+    },
+    { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
+  );
 
   let nextCursor = startCold + safeColdSize;
   if (nextCursor >= total) nextCursor = 0n;
@@ -301,13 +364,17 @@ async function runLogic(env: Env, startTimeMs: number) {
     return;
   }
 
-  const statusResults = await client.multicall({
-    contracts: candidates.map((addr) => ({
-      address: addr,
-      abi: lotteryAbi,
-      functionName: "status",
-    })),
-  });
+  const statusResults = await withRetry(
+    () =>
+      client.multicall({
+        contracts: candidates.map((addr) => ({
+          address: addr,
+          abi: lotteryAbi,
+          functionName: "status",
+        })),
+      }),
+    { tries: 3, baseDelayMs: 250, label: "status multicall" }
+  );
 
   const statusFailures = statusResults.filter((r) => r.status !== "success").length;
   console.log(`🧪 status multicall: total=${statusResults.length} failures=${statusFailures}`);
@@ -330,12 +397,18 @@ async function runLogic(env: Env, startTimeMs: number) {
 
   console.log(`⚡ Found ${openLotteries.length} Open lotteries to analyze.`);
 
-  // ✅ Change: use "latest" instead of "pending" to avoid RPC mempool-dependent calls timing out.
-  // You already control nonce locally via currentNonce++.
-  let currentNonce = await client.getTransactionCount({
-    address: account.address,
-    blockTag: "latest",
-  });
+  // ✅ This was your crash point. Wrap with retry + short RPC timeout.
+  // If it still fails, we stop the run gracefully (no half-sent nonces).
+  const currentNonceStart = await withRetry(
+    () =>
+      client.getTransactionCount({
+        address: account.address,
+        blockTag: "pending",
+      }),
+    { tries: 3, baseDelayMs: 300, label: "getTransactionCount(pending)" }
+  );
+
+  let currentNonce = currentNonceStart;
 
   const chunks = chunkArray(openLotteries, 25);
   let txCount = 0;
@@ -358,7 +431,10 @@ async function runLogic(env: Env, startTimeMs: number) {
       { address: addr, abi: lotteryAbi, functionName: "entropyRequestId" },
     ]);
 
-    const detailResults = await client.multicall({ contracts: detailCalls });
+    const detailResults = await withRetry(
+      () => client.multicall({ contracts: detailCalls }),
+      { tries: 3, baseDelayMs: 250, label: "details multicall" }
+    );
 
     type Candidate = {
       addr: Address;
@@ -398,7 +474,8 @@ async function runLogic(env: Env, startTimeMs: number) {
         rEntropy.status !== "success" ||
         rProvider.status !== "success" ||
         rReq.status !== "success"
-      ) continue;
+      )
+        continue;
 
       if (rPaused.result === true) continue;
 
@@ -466,18 +543,23 @@ async function runLogic(env: Env, startTimeMs: number) {
           }
         } else {
           try {
-            const fee = await client.readContract({
-              address: c.entropyAddr,
-              abi: entropyAbi,
-              functionName: "getFee",
-              args: [c.providerAddr],
-            });
+            const fee = await withRetry(
+              () =>
+                client.readContract({
+                  address: c.entropyAddr,
+                  abi: entropyAbi,
+                  functionName: "getFee",
+                  args: [c.providerAddr],
+                }),
+              { tries: 3, baseDelayMs: 250, label: "entropy.getFee" }
+            );
+
             value = BigInt(fee);
             await env.BOT_STATE.put(feeKey, value.toString(), { expirationTtl: 60 });
           } catch (e: any) {
             const msg = (e?.shortMessage || e?.message || "").toString();
-            console.warn(`   ⚠️ Fee lookup reverted; skipping draw for now: ${msg}`);
-            await env.BOT_STATE.put(attemptKey, `feeRevert:${Date.now()}`, {
+            console.warn(`   ⚠️ Fee lookup failed; skipping draw for now: ${msg}`);
+            await env.BOT_STATE.put(attemptKey, `feeFail:${Date.now()}`, {
               expirationTtl: Math.min(300, ATTEMPT_TTL_SEC),
             });
             continue;
@@ -487,13 +569,17 @@ async function runLogic(env: Env, startTimeMs: number) {
 
       // --- SIMULATE ---
       try {
-        await client.simulateContract({
-          account,
-          address: c.addr,
-          abi: lotteryAbi,
-          functionName: "finalize",
-          value,
-        });
+        await withRetry(
+          () =>
+            client.simulateContract({
+              account,
+              address: c.addr,
+              abi: lotteryAbi,
+              functionName: "finalize",
+              value,
+            }),
+          { tries: 2, baseDelayMs: 200, label: "simulate finalize" }
+        );
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         if (isTransientErrorMessage(msg)) {
@@ -511,34 +597,24 @@ async function runLogic(env: Env, startTimeMs: number) {
 
       // --- SEND TX ---
       try {
-        const hash = await wallet.writeContract({
-          account,
-          address: c.addr,
-          abi: lotteryAbi,
-          functionName: "finalize",
-          value,
-          nonce: currentNonce++,
-        });
+        const hash = await withRetry(
+          () =>
+            wallet.writeContract({
+              account,
+              address: c.addr,
+              abi: lotteryAbi,
+              functionName: "finalize",
+              value,
+              nonce: currentNonce++,
+            }),
+          { tries: 2, baseDelayMs: 250, label: "send finalize tx" }
+        );
 
         console.log(`   ✅ Tx Sent: ${hash}`);
         txCount++;
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ Tx failed: ${msg}`);
-
-        // If nonce drift happens (e.g., prior run left pending txs), resync once for future attempts.
-        if (isNonceErrorMessage(msg)) {
-          try {
-            const fresh = await client.getTransactionCount({
-              address: account.address,
-              blockTag: "latest",
-            });
-            console.warn(`   🔁 Resynced nonce to ${fresh}.`);
-            currentNonce = fresh;
-          } catch {
-            /* ignore */
-          }
-        }
       }
     }
   }
