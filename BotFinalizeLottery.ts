@@ -1,3 +1,4 @@
+// BotFinalizeLottery.ts
 import {
   createPublicClient,
   createWalletClient,
@@ -8,7 +9,6 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { etherlink } from "viem/chains";
-import { formatUnits as viemFormatUnits } from "viem";
 
 // --- TYPES & INTERFACES ---
 export interface Env {
@@ -23,11 +23,6 @@ export interface Env {
   MAX_TX?: string;
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
-
-  // ✅ NEW: tweet sync (indexer-driven)
-  SUBGRAPH_URL: string;
-  SITE_URL: string;
-  X_USER_ACCESS_TOKEN: string; // wrangler secret
 }
 
 // ABIs
@@ -41,7 +36,7 @@ const lotteryAbi = parseAbi([
   "function paused() external view returns (bool)",
   "function deadline() external view returns (uint64)",
   "function getSold() external view returns (uint256)",
-  "function minTickets() external view returns (uint64)",
+  "function minTickets() external view returns (uint64)", // ✅ NEW
   "function maxTickets() external view returns (uint64)",
   "function entropy() external view returns (address)",
   "function entropyProvider() external view returns (address)",
@@ -123,246 +118,6 @@ function statusLabel(s: bigint): string {
   }
 }
 
-// --------------------
-// ✅ Twitter helpers
-// --------------------
-function shortAddr(a: string) {
-  const s = (a || "").toLowerCase();
-  if (!s.startsWith("0x") || s.length < 10) return s || "—";
-  return `${s.slice(0, 4)}…${s.slice(-4)}`;
-}
-
-function explorerAddr(a: string) {
-  const s = (a || "").toLowerCase();
-  return `https://explorer.etherlink.com/address/${s}`;
-}
-
-function raffleLink(siteUrl: string, raffleId: string) {
-  return `${siteUrl.replace(/\/$/, "")}/?raffle=${raffleId.toLowerCase()}`;
-}
-
-function fmtUsdc6(raw: string | bigint) {
-  try {
-    const v = typeof raw === "bigint" ? raw : BigInt(raw || "0");
-    return Number(viemFormatUnits(v, 6)).toLocaleString("en-US", {
-      maximumFractionDigits: 2,
-    });
-  } catch {
-    return "0";
-  }
-}
-
-/** GraphQL fetch that survives 429/plain-text bodies (same robustness as your frontend) */
-async function gqlFetch<T>(url: string, query: string, variables: Record<string, any>): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await res.text();
-
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    throw new Error(`SUBGRAPH_BAD_JSON_${res.status}`);
-  }
-
-  if (!res.ok) throw new Error(`SUBGRAPH_HTTP_${res.status}`);
-  if (json?.errors?.length) throw new Error("SUBGRAPH_GQL_ERROR");
-
-  return json.data as T;
-}
-
-async function postTweet(env: Env, text: string) {
-  const token = env.X_USER_ACCESS_TOKEN;
-  if (!token) throw new Error("MISSING_ENV_X_USER_ACCESS_TOKEN");
-
-  const res = await fetch("https://api.x.com/2/tweets", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ text }),
-  });
-
-  const body = await res.text();
-  if (!res.ok) {
-    throw new Error(`X_TWEET_FAILED_${res.status}: ${body.slice(0, 300)}`);
-  }
-}
-
-type TweetCreate = {
-  id: string;
-  name: string;
-  creator: string;
-  winningPot: string;
-  createdAtTimestamp: string;
-};
-
-type TweetWin = {
-  id: string;
-  name: string;
-  creator: string;
-  winner: string;
-  winningPot: string;
-  completedAt: string;
-};
-
-type TweetCancel = {
-  id: string;
-  name: string;
-  creator: string;
-  canceledAt: string;
-};
-
-async function tweetSync(env: Env) {
-  const subgraphUrl = env.SUBGRAPH_URL;
-  const siteUrl = env.SITE_URL;
-
-  if (!subgraphUrl) throw new Error("MISSING_ENV_SUBGRAPH_URL");
-  if (!siteUrl) throw new Error("MISSING_ENV_SITE_URL");
-
-  const lastCreated = Number((await env.BOT_STATE.get("tweet:last_created_ts")) || "0");
-  const lastCompleted = Number((await env.BOT_STATE.get("tweet:last_completed_ts")) || "0");
-  const lastCanceled = Number((await env.BOT_STATE.get("tweet:last_canceled_ts")) || "0");
-
-  const query = `
-    query TweetFeed($n: Int!) {
-      latestCreated: raffles(
-        first: $n
-        orderBy: createdAtTimestamp
-        orderDirection: desc
-      ) {
-        id
-        name
-        creator
-        winningPot
-        createdAtTimestamp
-      }
-
-      latestCompleted: raffles(
-        first: $n
-        orderBy: completedAt
-        orderDirection: desc
-        where: { status: COMPLETED }
-      ) {
-        id
-        name
-        creator
-        winner
-        winningPot
-        completedAt
-      }
-
-      latestCanceled: raffles(
-        first: $n
-        orderBy: canceledAt
-        orderDirection: desc
-        where: { status: CANCELED }
-      ) {
-        id
-        name
-        creator
-        canceledAt
-      }
-    }
-  `;
-
-  type Resp = {
-    latestCreated: TweetCreate[];
-    latestCompleted: TweetWin[];
-    latestCanceled: TweetCancel[];
-  };
-
-  const data = await gqlFetch<Resp>(subgraphUrl, query, { n: 10 });
-
-  const newCreated = (data.latestCreated || []).filter(r => Number(r.createdAtTimestamp || "0") > lastCreated);
-  const newWins = (data.latestCompleted || []).filter(r => Number(r.completedAt || "0") > lastCompleted);
-  const newCancels = (data.latestCanceled || []).filter(r => Number(r.canceledAt || "0") > lastCanceled);
-
-  newCreated.sort((a, b) => Number(a.createdAtTimestamp) - Number(b.createdAtTimestamp));
-  newWins.sort((a, b) => Number(a.completedAt) - Number(b.completedAt));
-  newCancels.sort((a, b) => Number(a.canceledAt) - Number(b.canceledAt));
-
-  let maxCreated = lastCreated;
-  let maxCompleted = lastCompleted;
-  let maxCanceled = lastCanceled;
-
-  // CREATE
-  for (const r of newCreated) {
-    const ts = Number(r.createdAtTimestamp || "0");
-    const dedupeKey = `tweet:seen:create:${r.id.toLowerCase()}:${ts}`;
-    if (await env.BOT_STATE.get(dedupeKey)) continue;
-
-    const pot = fmtUsdc6(r.winningPot);
-    const link = raffleLink(siteUrl, r.id);
-
-    const text =
-`🎉 New raffle is live: ${r.name}
-💰 Prize: ${pot} USDC
-👤 Creator: ${shortAddr(r.creator)} (${explorerAddr(r.creator)})
-🎟️ Join: ${link}`;
-
-    await postTweet(env, text);
-
-    await env.BOT_STATE.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 * 30 });
-    if (ts > maxCreated) maxCreated = ts;
-  }
-
-  // WIN / SETTLED
-  for (const r of newWins) {
-    const ts = Number(r.completedAt || "0");
-    const dedupeKey = `tweet:seen:win:${r.id.toLowerCase()}:${ts}`;
-    if (await env.BOT_STATE.get(dedupeKey)) continue;
-
-    const pot = fmtUsdc6(r.winningPot);
-    const link = raffleLink(siteUrl, r.id);
-
-    const text =
-`🏆 Raffle settled: ${r.name}
-💰 Prize: ${pot} USDC
-👤 Creator: ${shortAddr(r.creator)} (${explorerAddr(r.creator)})
-🎉 Winner: ${shortAddr(r.winner)} (${explorerAddr(r.winner)})
-🔗 View: ${link}`;
-
-    await postTweet(env, text);
-
-    await env.BOT_STATE.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 * 30 });
-    if (ts > maxCompleted) maxCompleted = ts;
-  }
-
-  // CANCEL
-  for (const r of newCancels) {
-    const ts = Number(r.canceledAt || "0");
-    const dedupeKey = `tweet:seen:cancel:${r.id.toLowerCase()}:${ts}`;
-    if (await env.BOT_STATE.get(dedupeKey)) continue;
-
-    const link = raffleLink(siteUrl, r.id);
-
-    const text =
-`⛔ Raffle canceled: ${r.name}
-📍 Raffle: ${r.id.toLowerCase()}
-❗ Reason: not enough tickets sold (min tickets not reached)
-🔗 Details: ${link}`;
-
-    await postTweet(env, text);
-
-    await env.BOT_STATE.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 * 30 });
-    if (ts > maxCanceled) maxCanceled = ts;
-  }
-
-  await env.BOT_STATE.put("tweet:last_created_ts", String(maxCreated));
-  await env.BOT_STATE.put("tweet:last_completed_ts", String(maxCompleted));
-  await env.BOT_STATE.put("tweet:last_canceled_ts", String(maxCanceled));
-
-  console.log(
-    `🐦 tweetSync done: created=${newCreated.length} wins=${newWins.length} cancels=${newCancels.length}`
-  );
-}
-
 // --- MAIN WORKER ---
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
@@ -428,12 +183,6 @@ async function runLogic(env: Env, startTimeMs: number) {
 
   if (total === 0n) {
     console.log("ℹ️ Registry empty. Done.");
-    // still try tweet sync
-    try {
-      await tweetSync(env);
-    } catch (e: any) {
-      console.warn("🐦 tweetSync failed:", e?.message || e);
-    }
     return;
   }
 
@@ -477,12 +226,6 @@ async function runLogic(env: Env, startTimeMs: number) {
   if (candidates.length === 0) {
     console.log("ℹ️ No candidates. Done.");
     await env.BOT_STATE.put("cursor", nextCursor.toString());
-
-    try {
-      await tweetSync(env);
-    } catch (e: any) {
-      console.warn("🐦 tweetSync failed:", e?.message || e);
-    }
     return;
   }
 
@@ -510,12 +253,6 @@ async function runLogic(env: Env, startTimeMs: number) {
   if (openLotteries.length === 0) {
     console.log("ℹ️ No Open lotteries found.");
     await env.BOT_STATE.put("cursor", nextCursor.toString());
-
-    try {
-      await tweetSync(env);
-    } catch (e: any) {
-      console.warn("🐦 tweetSync failed:", e?.message || e);
-    }
     return;
   }
 
@@ -535,7 +272,7 @@ async function runLogic(env: Env, startTimeMs: number) {
 
     const tNow = nowSec();
 
-    // 8 calls per lottery (includes minTickets)
+    // ✅ 8 calls per lottery (includes minTickets)
     const detailCalls = chunk.flatMap((addr) => [
       { address: addr, abi: lotteryAbi, functionName: "deadline" },
       { address: addr, abi: lotteryAbi, functionName: "getSold" },
@@ -640,7 +377,7 @@ async function runLogic(env: Env, startTimeMs: number) {
         `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath})`
       );
 
-      // value depends on cancel vs draw
+      // ✅ value depends on cancel vs draw
       let value = 0n;
 
       if (!c.cancelPath) {
@@ -670,7 +407,7 @@ async function runLogic(env: Env, startTimeMs: number) {
         }
       }
 
-      // SIMULATE
+      // --- SIMULATE ---
       try {
         await client.simulateContract({
           account,
@@ -694,7 +431,7 @@ async function runLogic(env: Env, startTimeMs: number) {
 
       await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
 
-      // SEND TX
+      // --- SEND TX ---
       try {
         const hash = await wallet.writeContract({
           account,
@@ -716,11 +453,4 @@ async function runLogic(env: Env, startTimeMs: number) {
 
   await env.BOT_STATE.put("cursor", nextCursor.toString());
   console.log(`🏁 Run complete. txCount=${txCount} cursor=${nextCursor.toString()}`);
-
-  // ✅ NEW: tweet only what’s already indexed (subgraph)
-  try {
-    await tweetSync(env);
-  } catch (e: any) {
-    console.warn("🐦 tweetSync failed:", e?.message || e);
-  }
 }
