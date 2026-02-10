@@ -23,6 +23,10 @@ export interface Env {
   MAX_TX?: string;
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
+
+  // Optional knobs (safe defaults below)
+  RPC_TIMEOUT_MS?: string;
+  RPC_RETRIES?: string;
 }
 
 // ABIs
@@ -36,7 +40,7 @@ const lotteryAbi = parseAbi([
   "function paused() external view returns (bool)",
   "function deadline() external view returns (uint64)",
   "function getSold() external view returns (uint256)",
-  "function minTickets() external view returns (uint64)", // ✅ NEW
+  "function minTickets() external view returns (uint64)",
   "function maxTickets() external view returns (uint64)",
   "function entropy() external view returns (address)",
   "function entropyProvider() external view returns (address)",
@@ -94,7 +98,20 @@ function isTransientErrorMessage(msg: string): boolean {
     m.includes("rate") ||
     m.includes("connection") ||
     m.includes("econn") ||
-    m.includes("failed to fetch")
+    m.includes("failed to fetch") ||
+    m.includes("502") ||
+    m.includes("504")
+  );
+}
+
+function isNonceErrorMessage(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    m.includes("nonce too low") ||
+    m.includes("replacement transaction underpriced") ||
+    m.includes("already known") ||
+    m.includes("nonce has already been used") ||
+    m.includes("invalid nonce")
   );
 }
 
@@ -109,13 +126,58 @@ function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): numbe
 // map status number to label (your Solidity enum order)
 function statusLabel(s: bigint): string {
   switch (s) {
-    case 0n: return "FundingPending(0)";
-    case 1n: return "Open(1)";
-    case 2n: return "Drawing(2)";
-    case 3n: return "Completed(3)";
-    case 4n: return "Canceled(4)";
-    default: return `Unknown(${s.toString()})`;
+    case 0n:
+      return "FundingPending(0)";
+    case 1n:
+      return "Open(1)";
+    case 2n:
+      return "Drawing(2)";
+    case 3n:
+      return "Completed(3)";
+    case 4n:
+      return "Canceled(4)";
+    default:
+      return `Unknown(${s.toString()})`;
   }
+}
+
+/**
+ * Cloudflare-worker-friendly fetch wrapper:
+ * - request timeout via AbortController
+ * - retries on transient HTTP codes and network errors
+ */
+async function fetchWithTimeoutAndRetry(
+  input: RequestInfo,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+  retries: number
+): Promise<Response> {
+  let lastErr: any;
+
+  for (let i = 0; i <= retries; i++) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(input, { ...(init || {}), signal: ac.signal });
+      clearTimeout(t);
+
+      if ([429, 502, 503, 504].includes(res.status) && i < retries) {
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      clearTimeout(t);
+      lastErr = e;
+      if (i < retries) {
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+        continue;
+      }
+    }
+  }
+
+  throw lastErr;
 }
 
 // --- MAIN WORKER ---
@@ -161,12 +223,22 @@ async function runLogic(env: Env, startTimeMs: number) {
   }
 
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
+
+  // These defaults are tuned for your cron every minute + 25s budget
+  const RPC_TIMEOUT_MS = getSafeInt(env.RPC_TIMEOUT_MS, 12_000, 30_000);
+  const RPC_RETRIES = getSafeInt(env.RPC_RETRIES, 2, 5);
+
+  const transport = http(rpcUrl, {
+    fetch: (input, init) => fetchWithTimeoutAndRetry(input, init, RPC_TIMEOUT_MS, RPC_RETRIES),
+  });
+
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
 
-  const client = createPublicClient({ chain: etherlink, transport: http(rpcUrl) });
-  const wallet = createWalletClient({ account, chain: etherlink, transport: http(rpcUrl) });
+  const client = createPublicClient({ chain: etherlink, transport });
+  const wallet = createWalletClient({ account, chain: etherlink, transport });
 
   console.log(`👛 Bot address: ${account.address}`);
+  console.log(`🌐 RPC: ${rpcUrl} (timeout=${RPC_TIMEOUT_MS}ms retries=${RPC_RETRIES})`);
 
   const HOT_SIZE = getSafeSize(env.HOT_SIZE, 100n, 500n);
   const COLD_SIZE = getSafeSize(env.COLD_SIZE, 50n, 200n);
@@ -258,9 +330,11 @@ async function runLogic(env: Env, startTimeMs: number) {
 
   console.log(`⚡ Found ${openLotteries.length} Open lotteries to analyze.`);
 
+  // ✅ Change: use "latest" instead of "pending" to avoid RPC mempool-dependent calls timing out.
+  // You already control nonce locally via currentNonce++.
   let currentNonce = await client.getTransactionCount({
     address: account.address,
-    blockTag: "pending",
+    blockTag: "latest",
   });
 
   const chunks = chunkArray(openLotteries, 25);
@@ -272,7 +346,7 @@ async function runLogic(env: Env, startTimeMs: number) {
 
     const tNow = nowSec();
 
-    // ✅ 8 calls per lottery (includes minTickets)
+    // 8 calls per lottery (includes minTickets)
     const detailCalls = chunk.flatMap((addr) => [
       { address: addr, abi: lotteryAbi, functionName: "deadline" },
       { address: addr, abi: lotteryAbi, functionName: "getSold" },
@@ -377,7 +451,7 @@ async function runLogic(env: Env, startTimeMs: number) {
         `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath})`
       );
 
-      // ✅ value depends on cancel vs draw
+      // value depends on cancel vs draw
       let value = 0n;
 
       if (!c.cancelPath) {
@@ -385,7 +459,11 @@ async function runLogic(env: Env, startTimeMs: number) {
         const cachedFee = await env.BOT_STATE.get(feeKey);
 
         if (cachedFee) {
-          try { value = BigInt(cachedFee); } catch { value = 0n; }
+          try {
+            value = BigInt(cachedFee);
+          } catch {
+            value = 0n;
+          }
         } else {
           try {
             const fee = await client.readContract({
@@ -447,6 +525,20 @@ async function runLogic(env: Env, startTimeMs: number) {
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ Tx failed: ${msg}`);
+
+        // If nonce drift happens (e.g., prior run left pending txs), resync once for future attempts.
+        if (isNonceErrorMessage(msg)) {
+          try {
+            const fresh = await client.getTransactionCount({
+              address: account.address,
+              blockTag: "latest",
+            });
+            console.warn(`   🔁 Resynced nonce to ${fresh}.`);
+            currentNonce = fresh;
+          } catch {
+            /* ignore */
+          }
+        }
       }
     }
   }
