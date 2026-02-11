@@ -12,6 +12,7 @@ id = "e6a7e9d79fac43c9bf3e46af39cfe839"
 preview_id = "c5172c8114564aaa8745e4e780efa744"
 
 [vars]
+CRON_EVERY_MINUTES = "3"
 REGISTRY_ADDRESS = "0x1CD24E0C49b1B61ff07be12fBa3ce58eCb20b098"
 RPC_URL = "https://node.mainnet.etherlink.com"
 
