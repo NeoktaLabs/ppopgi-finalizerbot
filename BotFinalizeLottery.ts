@@ -24,7 +24,7 @@ export interface Env {
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
 
-  // ✅ NEW: cron interval (minutes), used only for the status endpoint countdown
+  // ✅ cron interval (minutes), used only for the status endpoint countdown
   CRON_EVERY_MINUTES?: string;
 }
 
@@ -179,16 +179,21 @@ async function kvDelSafe(env: Env, key: string) {
   }
 }
 
-// ✅ NEW: cron interval utilities (for accurate countdown in UI)
+// ✅ cron interval utilities (for accurate countdown in UI)
 function getCronEveryMinutes(env: Env): number {
   const raw = env.CRON_EVERY_MINUTES;
   const n = Number(raw);
   return Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 1;
 }
 
-function nextCronMs(now = Date.now(), everyMinutes = 1): number {
-  const step = Math.max(1, Math.floor(everyMinutes)) * 60_000;
-  return Math.ceil(now / step) * step;
+/**
+ * Compute the next expected cron boundary strictly AFTER now.
+ * Example: everyMinutes=3 -> boundaries at ... :00, :03, :06, :09 ...
+ */
+function nextCronMs(nowMs = Date.now(), everyMinutes = 1): number {
+  const m = Math.max(1, Math.floor(everyMinutes));
+  const step = m * 60_000;
+  return (Math.floor(nowMs / step) + 1) * step;
 }
 
 // A little helper to safely parse KV numbers
@@ -213,7 +218,7 @@ export default {
   /**
    * Status endpoint for your website.
    * - GET /bot-status -> JSON
-   * Any other path: 404 (prevents accidentally exposing an open endpoint surface).
+   * Any other path: 404
    *
    * ✅ Includes CORS so your frontend (localhost / production) can read it.
    */
@@ -294,7 +299,6 @@ export default {
         headers: {
           ...cors,
           "content-type": "application/json; charset=utf-8",
-          // tiny cache just to reduce spam when UI polls frequently
           "cache-control": "public, max-age=2",
         },
       }
@@ -466,7 +470,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           abi: lotteryAbi,
           functionName: "status",
         })),
-      }),
+      ),
     { tries: 3, baseDelayMs: 250, label: "status multicall" }
   );
 
@@ -491,7 +495,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
   console.log(`⚡ Found ${openLotteries.length} Open lotteries to analyze.`);
 
-  // This was your crash point: wrap with retry
   const currentNonceStart = await withRetry(
     () =>
       client.getTransactionCount({
@@ -512,7 +515,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
     const tNow = nowSec();
 
-    // 8 calls per lottery
     const detailCalls = chunk.flatMap((addr) => [
       { address: addr, abi: lotteryAbi, functionName: "deadline" },
       { address: addr, abi: lotteryAbi, functionName: "getSold" },
