@@ -23,6 +23,9 @@ export interface Env {
   MAX_TX?: string;
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
+
+  // ✅ NEW: cron interval (minutes), used only for the status endpoint countdown
+  CRON_EVERY_MINUTES?: string;
 }
 
 // ABIs
@@ -176,9 +179,16 @@ async function kvDelSafe(env: Env, key: string) {
   }
 }
 
-// For UI: approximate "next cron" when cron is "* * * * *"
-function nextMinuteMs(now = Date.now()): number {
-  return Math.ceil(now / 60000) * 60000;
+// ✅ NEW: cron interval utilities (for accurate countdown in UI)
+function getCronEveryMinutes(env: Env): number {
+  const raw = env.CRON_EVERY_MINUTES;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 1;
+}
+
+function nextCronMs(now = Date.now(), everyMinutes = 1): number {
+  const step = Math.max(1, Math.floor(everyMinutes)) * 60_000;
+  return Math.ceil(now / step) * step;
 }
 
 // A little helper to safely parse KV numbers
@@ -251,7 +261,9 @@ export default {
     const durationMs = parseKvNum(lastDurationRaw);
     const lastTxCount = parseKvNum(lastTxCountRaw);
 
-    const nextRun = nextMinuteMs(now);
+    // ✅ FIX: compute next run using your cron interval (e.g. 3 minutes)
+    const cronEveryMinutes = getCronEveryMinutes(env);
+    const nextRun = nextCronMs(now, cronEveryMinutes);
 
     return new Response(
       JSON.stringify(
@@ -270,6 +282,7 @@ export default {
           lastOk,
           secondsSinceLastOk: lastOk ? Math.floor((now - lastOk) / 1000) : null,
 
+          cronEveryMinutes,
           nextRun,
           secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
           lastError: lastError || null,
