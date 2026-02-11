@@ -181,37 +181,78 @@ function nextMinuteMs(now = Date.now()): number {
   return Math.ceil(now / 60000) * 60000;
 }
 
+// A little helper to safely parse KV numbers
+function parseKvNum(v: string | null): number | null {
+  if (!v) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // --- MAIN WORKER ---
 export default {
   /**
-   * Optional: expose health/status to your website.
-   * GET /  -> returns JSON with last run + next run + whether lock is held
+   * Status endpoint for your website.
+   * - GET /bot-status -> JSON
+   * Any other path: 404 (prevents accidentally exposing an open endpoint surface).
    */
-  async fetch(_req: Request, env: Env): Promise<Response> {
-    const lastRunRaw = await env.BOT_STATE.get("last_run_ts");
-    const lastOkRaw = await env.BOT_STATE.get("last_ok_ts");
-    const status = (await env.BOT_STATE.get("last_run_status")) || "unknown";
-    const lastError = await env.BOT_STATE.get("last_run_error");
-    const lock = await env.BOT_STATE.get("lock");
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+
+    if (req.method !== "GET") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+    if (url.pathname !== "/bot-status") {
+      return new Response("Not Found", { status: 404 });
+    }
+
+    const [
+      lastRunTsRaw,
+      lastFinishedTsRaw,
+      lastOkTsRaw,
+      lastStatus,
+      lastError,
+      lock,
+      lastRunId,
+      lastDurationRaw,
+      lastTxCountRaw,
+    ] = await Promise.all([
+      env.BOT_STATE.get("last_run_ts"),
+      env.BOT_STATE.get("last_run_finished_ts"),
+      env.BOT_STATE.get("last_ok_ts"),
+      env.BOT_STATE.get("last_run_status"),
+      env.BOT_STATE.get("last_run_error"),
+      env.BOT_STATE.get("lock"),
+      env.BOT_STATE.get("last_run_id"),
+      env.BOT_STATE.get("last_run_duration_ms"),
+      env.BOT_STATE.get("last_run_tx_count"),
+    ]);
 
     const now = Date.now();
-    const nrm = (v: string | null) => (v ? Number(v) : null);
-
-    const lastRun = nrm(lastRunRaw);
-    const lastOk = nrm(lastOkRaw);
+    const lastRun = parseKvNum(lastRunTsRaw);
+    const lastFinished = parseKvNum(lastFinishedTsRaw);
+    const lastOk = parseKvNum(lastOkTsRaw);
+    const durationMs = parseKvNum(lastDurationRaw);
+    const lastTxCount = parseKvNum(lastTxCountRaw);
 
     const nextRun = nextMinuteMs(now);
 
     return new Response(
       JSON.stringify(
         {
-          status,
+          status: lastStatus || "unknown",
           running: !!lock,
           lockRunId: lock || null,
+          lastRunId: lastRunId || null,
+
           lastRun,
+          lastFinished,
+          durationMs,
+          txCount: lastTxCount,
+
           secondsSinceLastRun: lastRun ? Math.floor((now - lastRun) / 1000) : null,
           lastOk,
           secondsSinceLastOk: lastOk ? Math.floor((now - lastOk) / 1000) : null,
+
           nextRun,
           secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
           lastError: lastError || null,
@@ -219,7 +260,13 @@ export default {
         null,
         2
       ),
-      { headers: { "content-type": "application/json; charset=utf-8" } }
+      {
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          // tiny cache just to reduce spam when UI polls frequently
+          "cache-control": "public, max-age=2",
+        },
+      }
     );
   },
 
@@ -230,16 +277,21 @@ export default {
 
     console.log(`🤖 Run ${runId} started`);
 
-    // write run markers early (best effort)
+    // Run markers early (best effort)
     await kvPutSafe(env, "last_run_ts", START_TIME.toString());
     await kvPutSafe(env, "last_run_status", "running");
     await kvPutSafe(env, "last_run_id", runId);
     await kvDelSafe(env, "last_run_error");
+    await kvDelSafe(env, "last_run_duration_ms");
+    await kvDelSafe(env, "last_run_tx_count");
+    await kvDelSafe(env, "last_run_finished_ts");
 
     const existingLock = await env.BOT_STATE.get("lock");
     if (existingLock) {
       console.warn(`⚠️ Locked by run ${existingLock}. Skipping.`);
       await kvPutSafe(env, "last_run_status", "skipped_locked");
+      await kvPutSafe(env, "last_run_finished_ts", Date.now().toString());
+      await kvPutSafe(env, "last_run_duration_ms", String(Date.now() - START_TIME));
       return;
     }
 
@@ -249,19 +301,31 @@ export default {
     if (confirmLock !== runId) {
       console.warn(`⚠️ Lock race lost. Exiting.`);
       await kvPutSafe(env, "last_run_status", "skipped_lock_race");
+      await kvPutSafe(env, "last_run_finished_ts", Date.now().toString());
+      await kvPutSafe(env, "last_run_duration_ms", String(Date.now() - START_TIME));
       return;
     }
 
+    let txCount = 0;
+
     try {
-      await runLogic(env, START_TIME);
+      txCount = await runLogic(env, START_TIME);
+
       await kvPutSafe(env, "last_run_status", "ok");
       await kvPutSafe(env, "last_ok_ts", Date.now().toString());
+      await kvPutSafe(env, "last_run_tx_count", String(txCount));
     } catch (e: any) {
       const msg = (e?.message || String(e)).toString();
       console.error("❌ Critical Error:", msg);
+
       await kvPutSafe(env, "last_run_status", "error");
       await kvPutSafe(env, "last_run_error", msg.slice(0, 500));
+      await kvPutSafe(env, "last_run_tx_count", String(txCount));
     } finally {
+      const finished = Date.now();
+      await kvPutSafe(env, "last_run_finished_ts", finished.toString());
+      await kvPutSafe(env, "last_run_duration_ms", String(finished - START_TIME));
+
       const currentLock = await env.BOT_STATE.get("lock");
       if (currentLock === runId) {
         await env.BOT_STATE.delete("lock");
@@ -271,7 +335,7 @@ export default {
   },
 };
 
-async function runLogic(env: Env, startTimeMs: number) {
+async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS) {
     throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS");
   }
@@ -279,8 +343,7 @@ async function runLogic(env: Env, startTimeMs: number) {
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
 
-  // ✅ Tighten RPC timeouts + retries to avoid the “request took too long” killing the whole run
-  // Note: viem `http()` supports `timeout`, `retryCount`, `retryDelay`.
+  // Tighten RPC timeouts + retries to reduce “request took too long”
   const transport = http(rpcUrl, {
     timeout: 12_000,
     retryCount: 2,
@@ -312,7 +375,7 @@ async function runLogic(env: Env, startTimeMs: number) {
 
   if (total === 0n) {
     console.log("ℹ️ Registry empty. Done.");
-    return;
+    return 0;
   }
 
   const startHot = total > HOT_SIZE ? total - HOT_SIZE : 0n;
@@ -361,7 +424,7 @@ async function runLogic(env: Env, startTimeMs: number) {
   if (candidates.length === 0) {
     console.log("ℹ️ No candidates. Done.");
     await env.BOT_STATE.put("cursor", nextCursor.toString());
-    return;
+    return 0;
   }
 
   const statusResults = await withRetry(
@@ -392,13 +455,12 @@ async function runLogic(env: Env, startTimeMs: number) {
   if (openLotteries.length === 0) {
     console.log("ℹ️ No Open lotteries found.");
     await env.BOT_STATE.put("cursor", nextCursor.toString());
-    return;
+    return 0;
   }
 
   console.log(`⚡ Found ${openLotteries.length} Open lotteries to analyze.`);
 
-  // ✅ This was your crash point. Wrap with retry + short RPC timeout.
-  // If it still fails, we stop the run gracefully (no half-sent nonces).
+  // This was your crash point: wrap with retry
   const currentNonceStart = await withRetry(
     () =>
       client.getTransactionCount({
@@ -419,7 +481,7 @@ async function runLogic(env: Env, startTimeMs: number) {
 
     const tNow = nowSec();
 
-    // 8 calls per lottery (includes minTickets)
+    // 8 calls per lottery
     const detailCalls = chunk.flatMap((addr) => [
       { address: addr, abi: lotteryAbi, functionName: "deadline" },
       { address: addr, abi: lotteryAbi, functionName: "getSold" },
@@ -528,7 +590,6 @@ async function runLogic(env: Env, startTimeMs: number) {
         `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath})`
       );
 
-      // value depends on cancel vs draw
       let value = 0n;
 
       if (!c.cancelPath) {
@@ -621,4 +682,6 @@ async function runLogic(env: Env, startTimeMs: number) {
 
   await env.BOT_STATE.put("cursor", nextCursor.toString());
   console.log(`🏁 Run complete. txCount=${txCount} cursor=${nextCursor.toString()}`);
+
+  return txCount;
 }
