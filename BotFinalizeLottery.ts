@@ -188,21 +188,38 @@ function parseKvNum(v: string | null): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function corsHeadersFor(req: Request): Record<string, string> {
+  const origin = req.headers.get("Origin") || "*";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
 // --- MAIN WORKER ---
 export default {
   /**
    * Status endpoint for your website.
    * - GET /bot-status -> JSON
    * Any other path: 404 (prevents accidentally exposing an open endpoint surface).
+   *
+   * ✅ Includes CORS so your frontend (localhost / production) can read it.
    */
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    const cors = corsHeadersFor(req);
+
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors });
+    }
 
     if (req.method !== "GET") {
-      return new Response("Method Not Allowed", { status: 405 });
+      return new Response("Method Not Allowed", { status: 405, headers: cors });
     }
     if (url.pathname !== "/bot-status") {
-      return new Response("Not Found", { status: 404 });
+      return new Response("Not Found", { status: 404, headers: cors });
     }
 
     const [
@@ -262,6 +279,7 @@ export default {
       ),
       {
         headers: {
+          ...cors,
           "content-type": "application/json; charset=utf-8",
           // tiny cache just to reduce spam when UI polls frequently
           "cache-control": "public, max-age=2",
