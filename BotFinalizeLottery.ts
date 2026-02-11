@@ -470,7 +470,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           abi: lotteryAbi,
           functionName: "status",
         })),
-      ),
+      }),
     { tries: 3, baseDelayMs: 250, label: "status multicall" }
   );
 
