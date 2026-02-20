@@ -18,6 +18,6 @@ RPC_URL = "https://node.mainnet.etherlink.com"
 
 HOT_SIZE = "100"
 COLD_SIZE = "50"
-MAX_TX = "10"
+MAX_TX = "5"
 TIME_BUDGET_MS = "25000"
 ATTEMPT_TTL_SEC = "600"
