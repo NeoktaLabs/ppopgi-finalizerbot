@@ -1,4 +1,4 @@
-// BotFinalizeLottery.ts
+// BotFinalizeLottery.ts (UPDATED: uses Entropy V2 fee = getFeeV2(callbackGasLimit))
 import {
   createPublicClient,
   createWalletClient,
@@ -44,11 +44,14 @@ const lotteryAbi = parseAbi([
   "function entropy() external view returns (address)",
   "function entropyProvider() external view returns (address)",
   "function entropyRequestId() external view returns (uint64)",
+  // ✅ NEW: fee in LotterySingleWinnerV2 depends on callbackGasLimit
+  "function callbackGasLimit() external view returns (uint32)",
   "function finalize() external payable",
 ]);
 
+// ✅ UPDATED: Entropy V2 fee API used by your contract: getFeeV2(callbackGasLimit)
 const entropyAbi = parseAbi([
-  "function getFee(address provider) external view returns (uint256)",
+  "function getFeeV2(uint32 callbackGasLimit) external view returns (uint256)",
 ]);
 
 // --- HELPERS ---
@@ -524,6 +527,8 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       { address: addr, abi: lotteryAbi, functionName: "entropy" },
       { address: addr, abi: lotteryAbi, functionName: "entropyProvider" },
       { address: addr, abi: lotteryAbi, functionName: "entropyRequestId" },
+      // ✅ NEW: needed for getFeeV2
+      { address: addr, abi: lotteryAbi, functionName: "callbackGasLimit" },
     ]);
 
     const detailResults = await withRetry(
@@ -539,6 +544,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       maxTickets: bigint;
       entropyAddr: Address;
       providerAddr: Address;
+      callbackGasLimit: number; // uint32 fits in number
       isExpired: boolean;
       isFull: boolean;
       cancelPath: boolean;
@@ -549,7 +555,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
     for (let i = 0; i < chunk.length; i++) {
       const lottery = chunk[i];
-      const baseIdx = i * 8;
+      const baseIdx = i * 9;
 
       const rDeadline = detailResults[baseIdx];
       const rSold = detailResults[baseIdx + 1];
@@ -559,6 +565,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       const rEntropy = detailResults[baseIdx + 5];
       const rProvider = detailResults[baseIdx + 6];
       const rReq = detailResults[baseIdx + 7];
+      const rGas = detailResults[baseIdx + 8];
 
       if (
         rDeadline.status !== "success" ||
@@ -568,7 +575,8 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         rPaused.status !== "success" ||
         rEntropy.status !== "success" ||
         rProvider.status !== "success" ||
-        rReq.status !== "success"
+        rReq.status !== "success" ||
+        rGas.status !== "success"
       )
         continue;
 
@@ -585,6 +593,10 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       const entropyAddr = rEntropy.result as Address;
       const providerAddr = rProvider.result as Address;
 
+      // callbackGasLimit is uint32; viem returns bigint for uint32 in many setups
+      const gasBig = BigInt(rGas.result as any);
+      const callbackGasLimit = Number(gasBig); // safe: uint32 <= 4,294,967,295
+
       const isExpired = tNow >= deadline;
       const isFull = maxTickets > 0n && sold >= maxTickets;
 
@@ -600,6 +612,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         maxTickets,
         entropyAddr,
         providerAddr,
+        callbackGasLimit,
         isExpired,
         isFull,
         cancelPath,
@@ -620,13 +633,15 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       if (recentAttempt) continue;
 
       console.log(
-        `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath})`
+        `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath} gas=${c.callbackGasLimit})`
       );
 
       let value = 0n;
 
+      // If not cancelPath, we must pay entropy fee (V2)
       if (!c.cancelPath) {
-        const feeKey = `fee:${lower(c.entropyAddr)}:${lower(c.providerAddr)}`;
+        // ✅ fee varies with entropyAddr + callbackGasLimit (provider is NOT needed for getFeeV2)
+        const feeKey = `feev2:${lower(c.entropyAddr)}:${c.callbackGasLimit}`;
         const cachedFee = await env.BOT_STATE.get(feeKey);
 
         if (cachedFee) {
@@ -642,17 +657,18 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
                 client.readContract({
                   address: c.entropyAddr,
                   abi: entropyAbi,
-                  functionName: "getFee",
-                  args: [c.providerAddr],
+                  functionName: "getFeeV2",
+                  args: [c.callbackGasLimit],
                 }),
-              { tries: 3, baseDelayMs: 250, label: "entropy.getFee" }
+              { tries: 3, baseDelayMs: 250, label: "entropy.getFeeV2" }
             );
 
             value = BigInt(fee);
+            // keep short TTL; fee can change
             await env.BOT_STATE.put(feeKey, value.toString(), { expirationTtl: 60 });
           } catch (e: any) {
             const msg = (e?.shortMessage || e?.message || "").toString();
-            console.warn(`   ⚠️ Fee lookup failed; skipping draw for now: ${msg}`);
+            console.warn(`   ⚠️ FeeV2 lookup failed; skipping draw for now: ${msg}`);
             await env.BOT_STATE.put(attemptKey, `feeFail:${Date.now()}`, {
               expirationTtl: Math.min(300, ATTEMPT_TTL_SEC),
             });
